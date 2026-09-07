@@ -1,0 +1,16 @@
+[Unit]
+Description=Codex Supervisor global interactive watcher
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/codex-supervisor watch --interval 5
+Environment=PATH=%h/.local/bin:%h/.nvm/versions/node/v22.23.2/bin:/usr/local/bin:/usr/bin:/bin
+Environment=CODEX_SUPERVISOR_CODEX_PATH=%h/.nvm/versions/node/v22.23.2/bin/codex
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

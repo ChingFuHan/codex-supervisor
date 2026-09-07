@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-supervisor"
+version = "0.1.0"
+description = "Supervisor for Codex CLI — auto-resumes after usage/rate limits"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+codex-supervisor = "codex_supervisor.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "slow: systemd integration tests, require running systemd user session",
+    "smoke: real codex tests, require codex and quota",
+]

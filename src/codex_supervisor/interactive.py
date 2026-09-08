@@ -21,16 +21,23 @@ logger = logging.getLogger(__name__)
 UTC = dt.timezone.utc
 # An accepted queue command is not proof of execution. Never resend on timeout.
 QUEUE_ACK_SECONDS = 120
+PROGRESS_ITEM_TYPES = frozenset(("Reasoning", "CommandExecution", "Extension", "AgentMessage"))
 
 
 class RolloutTail:
-    """Bounded-memory, incremental read of complete lifecycle records only."""
+    """Bounded-memory, incremental read of lifecycle and current-turn progress."""
 
     def __init__(self, path: Path):
         self.path = path
         self.offset = 0
         self.identity = None
         self.latest: dict | None = None
+        self.active_turn_id: str | None = None
+        self.active_turn_started_at: str | None = None
+        self.active_turn_terminal = False
+        self.progress_item_count = 0
+        self.progress_last_at: str | None = None
+        self.progress_item_types: list[str] = []
 
     def poll(self) -> dict | None:
         with self.path.open("rb") as stream:
@@ -40,6 +47,12 @@ class RolloutTail:
                 self.offset = 0
                 self.latest = None
                 self.identity = identity
+                self.active_turn_id = None
+                self.active_turn_started_at = None
+                self.active_turn_terminal = False
+                self.progress_item_count = 0
+                self.progress_last_at = None
+                self.progress_item_types = []
             stream.seek(self.offset)
             while True:
                 # Bound individual lines as well as the number retained. Oversize
@@ -63,9 +76,39 @@ class RolloutTail:
                 payload = event.get("payload")
                 if not isinstance(payload, dict):
                     continue
-                if payload.get("type") in ("task_started", "task_complete", "turn_aborted"):
+                kind = payload.get("type")
+                if kind in ("task_started", "task_complete", "turn_aborted"):
                     self.latest = event
+                    if kind == "task_started":
+                        self.active_turn_id = payload.get("turn_id")
+                        self.active_turn_started_at = event.get("timestamp")
+                        self.active_turn_terminal = False
+                        self.progress_item_count = 0
+                        self.progress_last_at = None
+                        self.progress_item_types = []
+                    elif payload.get("turn_id") == self.active_turn_id:
+                        self.active_turn_terminal = True
+                elif kind == "item_completed":
+                    item = payload.get("item")
+                    item_type = item.get("type") if isinstance(item, dict) else None
+                    turn_id = payload.get("turn_id")
+                    if (turn_id == self.active_turn_id and not self.active_turn_terminal
+                            and item_type in PROGRESS_ITEM_TYPES):
+                        self.progress_item_count += 1
+                        self.progress_last_at = event.get("timestamp")
+                        if item_type not in self.progress_item_types:
+                            self.progress_item_types.append(item_type)
         return self.latest
+
+    @property
+    def progress_snapshot(self) -> dict:
+        return {
+            "turn_id": self.active_turn_id,
+            "started_at": self.active_turn_started_at,
+            "item_count": self.progress_item_count,
+            "last_at": self.progress_last_at,
+            "item_types": list(self.progress_item_types),
+        }
 
 
 def event_key(event: dict | None) -> str:
@@ -132,6 +175,84 @@ class InteractiveSupervisor:
             tail = self.tails[sid] = RolloutTail(path)
         return tail.poll()
 
+    def _observe_progress(self, job: Job, progress: dict, now: dt.datetime) -> bool:
+        """Persist only progress belonging to the continuation turn."""
+        if (not job.continuation_turn_id
+                or progress["turn_id"] != job.continuation_turn_id
+                or job.continuation_outcome in {
+                    "completed", "rate_limited_before_progress", "rate_limited_after_progress",
+                    "failed", "aborted", "unconfirmed",
+                }):
+            return False
+        if progress["item_count"] <= job.progress_item_count:
+            return False
+        job.progress_item_count = progress["item_count"]
+        job.last_progress_at = progress["last_at"] or now.isoformat()
+        job.progress_summary = progress["item_types"]
+        if job.continuation_outcome in ("queued", "started"):
+            job.continuation_outcome = "working"
+            self._record(job, "CONTINUATION_WORKING", now,
+                         turn_id=job.continuation_turn_id,
+                         progress_items=job.progress_item_count,
+                         progress_types=job.progress_summary)
+        return True
+
+    def _bind_continuation(self, job: Job, event: dict, tail: RolloutTail,
+                           now: dt.datetime) -> None:
+        payload = event.get("payload", {})
+        turn_id = payload.get("turn_id")
+        if not turn_id or job.continuation_turn_id:
+            return
+        job.continuation_turn_id = turn_id
+        if tail.active_turn_id == turn_id:
+            job.continuation_started_at = tail.active_turn_started_at
+        elif payload.get("type") == "task_started":
+            job.continuation_started_at = event.get("timestamp", now.isoformat())
+
+    def _mark_continuation_terminal(self, job: Job, outcome: str,
+                                    now: dt.datetime) -> None:
+        if not job.continuation_turn_id and job.continuation_outcome != "queued":
+            return
+        job.continuation_outcome = outcome
+        event = {
+            "completed": "CONTINUATION_COMPLETED",
+            "rate_limited_before_progress": "CONTINUATION_RATE_LIMITED_BEFORE_PROGRESS",
+            "rate_limited_after_progress": "CONTINUATION_RATE_LIMITED_AFTER_PROGRESS",
+            "failed": "CONTINUATION_FAILED",
+            "aborted": "CONTINUATION_ABORTED",
+        }.get(outcome)
+        if event:
+            self._record(job, event, now,
+                         turn_id=job.continuation_turn_id,
+                         progress_items=job.progress_item_count,
+                         progress_types=job.progress_summary)
+
+    def _restore_legacy_terminal(self, job: Job, event: dict, tail: RolloutTail,
+                                 progress: dict, key: str, now: dt.datetime) -> bool:
+        """Backfill outcome for a queued turn observed by the pre-progress watcher."""
+        payload = event.get("payload", {})
+        if (job.continuation_outcome is not None
+                or job.status != JobStatus.RATE_LIMITED
+                or not job.queue_id
+                or payload.get("type") != "task_complete"
+                or job.last_exit != event.get("timestamp")
+                or not job.submitted_event
+                or job.submitted_event == key):
+            return False
+        job.continuation_outcome = "queued"
+        self._bind_continuation(job, event, tail, now)
+        if progress["turn_id"] == job.continuation_turn_id:
+            job.progress_item_count = progress["item_count"]
+            job.last_progress_at = progress["last_at"]
+            job.progress_summary = progress["item_types"]
+        self._mark_continuation_terminal(
+            job,
+            "rate_limited_after_progress" if job.progress_item_count else
+            "rate_limited_before_progress",
+            now,
+        )
+        return True
+
     def tick(self, info: dict, prompt: str = "continue", *, adopt: bool = False,
              continue_now: bool = False, now: dt.datetime | None = None) -> Job | None:
         """One non-sleeping session step; the file lock also protects other watchers."""
@@ -140,6 +261,8 @@ class InteractiveSupervisor:
         jid = self.job_id(sid)
         with self.store.lock_job(jid):
             event = self._snapshot(info)
+            tail = self.tails[sid]
+            progress = tail.progress_snapshot
             key = event_key(event)
             payload = event["payload"] if event else {}
             kind = payload.get("type")
@@ -168,6 +291,13 @@ class InteractiveSupervisor:
             if job.status == JobStatus.CANCELLED:
                 return job
 
+            legacy_restored = self._restore_legacy_terminal(
+                job, event, tail, progress, key, now,
+            ) if event else False
+            progress_changed = self._observe_progress(job, progress, now)
+            if progress_changed or legacy_restored:
+                self.store.save_job(job)
+
             if continue_now:
                 if job.queued_at:
                     raise ValueError("a continuation is already pending; not enqueueing another")
@@ -179,17 +309,22 @@ class InteractiveSupervisor:
 
             if job.queued_at:
                 if key != job.observed_event:
+                    continuation_pending = True
                     job.queued_at = None
                     self._record(job, "NEW_LIFECYCLE_EVENT", now, lifecycle=kind)
                 elif (now - dt.datetime.fromisoformat(job.queued_at)).total_seconds() >= QUEUE_ACK_SECONDS:
                     if job.status != JobStatus.FAILED:
                         job.status = JobStatus.FAILED
                         job.last_error = "queue delivery not confirmed within 120s; not resending; check the original TUI"
+                        job.continuation_outcome = "unconfirmed"
                         self.store.save_job(job)
                         self._record(job, "QUEUE_UNCONFIRMED", now)
+                        self._record(job, "CONTINUATION_UNCONFIRMED", now)
                     return job
                 else:
                     return job
+            else:
+                continuation_pending = job.continuation_outcome == "queued"
 
             if key != job.observed_event:
                 job.observed_event = key
@@ -197,15 +332,29 @@ class InteractiveSupervisor:
                 job.parsed_reset = None
                 job.last_error = None
                 if kind == "task_started":
+                    if continuation_pending:
+                        self._bind_continuation(job, event, tail, now)
+                        job.continuation_outcome = "started"
                     job.status = JobStatus.RUNNING
                     job.last_start = event.get("timestamp", now.isoformat())
                     job.exit_classification = None
                     self._record(job, "TURN_STARTED", now)
+                    if continuation_pending:
+                        self._record(job, "CONTINUATION_STARTED", now,
+                                     turn_id=job.continuation_turn_id)
+                        self._observe_progress(job, progress, now)
                 elif kind == "turn_aborted":
+                    if continuation_pending:
+                        self._bind_continuation(job, event, tail, now)
                     job.status = JobStatus.CANCELLED
                     job.exit_classification = ExitClassification.USER_INTERRUPT.value
                     self._record(job, "USER_INTERRUPT", now)
+                    if continuation_pending:
+                        self._mark_continuation_terminal(job, "aborted", now)
                 elif kind == "task_complete":
+                    if continuation_pending:
+                        self._bind_continuation(job, event, tail, now)
+                        self._observe_progress(job, progress, now)
                     job.last_exit = event.get("timestamp", now.isoformat())
                     if limit:
                         # Old reset times stay in the past; never move them to tomorrow
@@ -224,16 +373,27 @@ class InteractiveSupervisor:
                         job.scheduled_resume = wake.isoformat()
                         self._record(job, "RATE_LIMIT", now, reset_at=job.parsed_reset,
                                      wake_at=job.scheduled_resume, retry=job.rate_limit_retries)
+                        if continuation_pending:
+                            self._mark_continuation_terminal(
+                                job,
+                                "rate_limited_after_progress" if job.progress_item_count else
+                                "rate_limited_before_progress",
+                                now,
+                            )
                     elif payload.get("error"):
                         job.status = JobStatus.FAILED
                         job.exit_classification = ExitClassification.UNKNOWN_FAILURE.value
                         job.last_error = "Codex turn failed without a rate-limit error; inspect original TUI"
                         self._record(job, "TURN_FAILED", now)
+                        if continuation_pending:
+                            self._mark_continuation_terminal(job, "failed", now)
                     else:
                         job.status = JobStatus.COMPLETED
                         job.exit_classification = ExitClassification.NORMAL_COMPLETION.value
                         job.rate_limit_retries = 0
                         self._record(job, "TURN_COMPLETED", now)
+                        if continuation_pending:
+                            self._mark_continuation_terminal(job, "completed", now)
                 self.store.save_job(job)
 
             if (job.scheduled_resume and job.status == JobStatus.RATE_LIMITED
@@ -258,6 +418,12 @@ class InteractiveSupervisor:
         job.scheduled_resume = None
         job.last_error = None
         job.queue_id = None
+        job.continuation_turn_id = None
+        job.continuation_started_at = None
+        job.last_progress_at = None
+        job.progress_item_count = 0
+        job.progress_summary = []
+        job.continuation_outcome = "queued"
         job.rate_limit_retries += 1
         job.codex_command = [self.codex, "queue", "--thread", job.session_id,
                              "--message", job.resume_prompt]
@@ -272,11 +438,14 @@ class InteractiveSupervisor:
             words = result.stdout.split()
             if len(words) >= 3 and words[:2] == ["Queued", "message"]:
                 job.queue_id = str(uuid.UUID(words[2]))
-            self._record(job, "QUEUED", now, queue_id=job.queue_id, exit_code=result.returncode)
+            self._record(job, "QUEUED", now, queue_id=job.queue_id,
+                         exit_code=result.returncode, outcome=job.continuation_outcome)
         except (OSError, subprocess.TimeoutExpired, RuntimeError, ValueError) as exc:
             job.status = JobStatus.FAILED
             job.last_error = f"queue outcome unconfirmed; not resending: {exc}"
+            job.continuation_outcome = "unconfirmed"
             self._record(job, "QUEUE_FAILED", now, error=job.last_error)
+            self._record(job, "CONTINUATION_UNCONFIRMED", now)
         self.store.save_job(job)
 
     def watch(self, session_id: str | None = None, interval: int = 5,

@@ -83,13 +83,14 @@ journalctl --user -u codex-supervisor-watch.service -f
 
 ## Rate limit 後的行為
 
-1. 唯讀追蹤 rollout 的最新 `task_started`、`task_complete`、`turn_aborted`。
+1. 唯讀追蹤 rollout 的 lifecycle，以及目前 turn 已完成的 `Reasoning`、`CommandExecution`、`Extension`、`AgentMessage` 項目。
 2. 最新完成回合的 error 確認為 rate limit，才計算 reset 時間。
 3. 支援本地時區的時刻、完整日期、ISO timestamp，以及相對等待時間。
 4. 原互動 Codex 保持開啟；Supervisor 保存狀態並等待。
 5. 到期再確認回合未被手動續跑／中斷取代，執行 `codex queue --thread <uuid> --message continue`。
-6. 分別紀錄「已入列」、「新回合開始」、「回合完成」。入列成功不等於任務已完成。
-7. 再次遇到 rate limit 就重複；限額重試次數無上限。正常回合完成後不額外送 `continue`，但繼續監控之後的回合。
+6. 分別紀錄「已入列」、「新回合開始」、「已有工作項目進度」、「回合完成」。入列成功或新回合開始都不等於任務已經工作。
+7. `codex-supervisor status` 會顯示 continuation outcome、turn、最後進度時間、項目數與類型；若回合立刻再次超額，會標示 `rate_limited_before_progress`。
+8. 再次遇到 rate limit 就重複；限額重試次數無上限。正常回合完成後不額外送 `continue`，但繼續監控之後的回合。
 
 沒有 reset 時間時，預設等待 30 分鐘，指數退避至最多 4 小時。
 有明確 reset 時間則使用該時間；已過期可立即送出，仍受事件去重保護。

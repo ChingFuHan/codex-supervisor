@@ -60,6 +60,12 @@ class Job:
     submitted_event: str | None = None
     queued_at: str | None = None
     queue_id: str | None = None
+    continuation_turn_id: str | None = None
+    continuation_started_at: str | None = None
+    last_progress_at: str | None = None
+    progress_item_count: int = 0
+    progress_summary: list[str] = dataclasses.field(default_factory=list)
+    continuation_outcome: str | None = None
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)

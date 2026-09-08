@@ -106,6 +106,12 @@ def cmd_status(args, config, store) -> int:
     print(f"parsed_reset:      {job.parsed_reset or '(none)'}")
     print(f"queue_id:          {job.queue_id or '(none)'}")
     print(f"queued_at:         {job.queued_at or '(none)'}")
+    print(f"continuation:      {job.continuation_outcome or '(none)'}")
+    print(f"continuation_turn: {job.continuation_turn_id or '(none)'}")
+    print(f"continuation_start:{job.continuation_started_at or '(none)'}")
+    print(f"last_progress_at:  {job.last_progress_at or '(none)'}")
+    print(f"progress_items:    {job.progress_item_count}")
+    print(f"progress_types:    {', '.join(job.progress_summary) or '(none)'}")
     print(f"command:           {' '.join(job.codex_command)}")
     return 0
 

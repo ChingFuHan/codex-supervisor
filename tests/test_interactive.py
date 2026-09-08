@@ -46,6 +46,15 @@ def limited(path, turn="t1", reset="2026-09-07T12:01:00Z"):
                        message=f"Usage limit. Resets at {reset}" if reset else "Usage limit."))
 
 
+def progress(path, turn="t1", item_type="CommandExecution", timestamp=None):
+    event = dict(timestamp=(timestamp or NOW).isoformat(), type="event_msg",
+                 payload=dict(type="item_completed", turn_id=turn,
+                              item=dict(type=item_type, id=f"item-{turn}-{item_type}")))
+    with path.open("a") as stream:
+        stream.write(json.dumps(event) + "\n")
+    return event
+
+
 def success(*args, **kwargs):
     return subprocess.CompletedProcess(args[0], 0,
         f"Queued message {uuid.uuid4()} for thread {SID}.\n", "")
@@ -69,6 +78,126 @@ def test_wait_queue_complete_then_another_limit(monitor):
         limited(path, "t3", "2026-09-07T11:00:00Z")
         sup.tick(info, now=NOW)
         assert queue.call_count == 2
+
+
+def test_continuation_rate_limit_before_progress_is_explicit(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        progress(path, "t2", "UserMessage")
+        limited(path, "t2", "2026-09-07T13:00:00Z")
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+    assert queue.call_count == 1
+    assert job.status == JobStatus.RATE_LIMITED
+    assert job.continuation_outcome == "rate_limited_before_progress"
+    assert job.continuation_turn_id == "t2"
+    assert job.progress_item_count == 0
+
+
+def test_continuation_progress_is_recorded_before_completion(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        progress(path, "t2", "CommandExecution", NOW + dt.timedelta(seconds=61))
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+    assert queue.call_count == 1
+    assert job.status == JobStatus.RUNNING
+    assert job.continuation_outcome == "working"
+    assert job.progress_item_count == 1
+    assert job.progress_summary == ["CommandExecution"]
+
+
+def test_continuation_rate_limit_after_progress_is_distinguished(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        progress(path, "t2", "Reasoning")
+        limited(path, "t2", "2026-09-07T13:00:00Z")
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+    assert queue.call_count == 1
+    assert job.status == JobStatus.RATE_LIMITED
+    assert job.continuation_outcome == "rate_limited_after_progress"
+    assert job.progress_item_count == 1
+    assert job.progress_summary == ["Reasoning"]
+
+
+def test_progress_after_terminal_event_is_not_counted(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        limited(path, "t2", "2026-09-07T13:00:00Z")
+        progress(path, "t2", "CommandExecution")
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+    assert queue.call_count == 1
+    assert job.continuation_outcome == "rate_limited_before_progress"
+    assert job.progress_item_count == 0
+
+
+def test_legacy_queued_terminal_is_backfilled(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success):
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        progress(path, "t2", "UserMessage")
+        limited(path, "t2", "2026-09-07T13:00:00Z")
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+    job.continuation_turn_id = None
+    job.continuation_started_at = None
+    job.last_progress_at = None
+    job.progress_item_count = 0
+    job.progress_summary = []
+    job.continuation_outcome = None
+    sup.store.save_job(job)
+    recovered = InteractiveSupervisor(sup.config, sup.store, "codex").tick(
+        info, now=NOW + dt.timedelta(seconds=62),
+    )
+    assert recovered.continuation_outcome == "rate_limited_before_progress"
+    assert recovered.continuation_turn_id == "t2"
+
+
+def test_continuation_progress_survives_watcher_restart(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        append(path, "task_started", "t2")
+        progress(path, "t2", "Extension")
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+        restarted = InteractiveSupervisor(sup.config, sup.store, "codex")
+        recovered = restarted.tick(info, now=NOW + dt.timedelta(seconds=62))
+    assert queue.call_count == 1
+    assert job.continuation_outcome == "working"
+    assert recovered.continuation_outcome == "working"
+    assert recovered.continuation_turn_id == "t2"
+    assert recovered.progress_item_count == 1
+    assert recovered.progress_summary == ["Extension"]
+
+
+def test_queue_without_new_turn_becomes_unconfirmed(monitor):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=181))
+    assert queue.call_count == 1
+    assert job.status == JobStatus.FAILED
+    assert job.continuation_outcome == "unconfirmed"
 
 
 def test_no_reset_backoff_does_not_move_on_every_poll(monitor):

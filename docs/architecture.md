@@ -89,9 +89,12 @@ according to the persisted job mode. Current execution output takes precedence;
 stale goals DB state cannot turn a successful exit or Ctrl+C into a rate limit.
 
 `examples/codex-supervisor-watch.service` is the user-level service template. Install
-it under `~/.config/systemd/user/`, then run `systemctl --user daemon-reload` and
-`systemctl --user enable --now codex-supervisor-watch.service`. Stop only that
-identified unit with `systemctl --user disable --now codex-supervisor-watch.service`.
+it under `~/.config/systemd/user/`, enable user linger with
+`loginctl enable-linger "$USER"`, then run `systemctl --user daemon-reload` and
+`systemctl --user enable --now codex-supervisor-watch.service`. User linger is
+required when the watcher must start after boot before an interactive login; without
+it, the user service depends on the login session. Stop only that identified unit
+with `systemctl --user disable --now codex-supervisor-watch.service`.
 The template includes the locally verified NVM Codex path; update that environment
 entry after a Node/Codex upgrade. `scheduler.py` remains a legacy optional backend
 with its existing timer tests. Never stop unrelated units or modify system-level

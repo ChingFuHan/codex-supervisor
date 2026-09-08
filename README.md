@@ -63,8 +63,19 @@ codex-supervisor watch
 mkdir -p ~/.config/systemd/user
 cp examples/codex-supervisor-watch.service ~/.config/systemd/user/
 systemctl --user daemon-reload
+loginctl enable-linger "$USER"
 systemctl --user enable --now codex-supervisor-watch.service
 systemctl --user status codex-supervisor-watch.service
+```
+
+`systemctl --user enable --now` 啟用並立即啟動目前 user 的 service；
+`loginctl enable-linger "$USER"` 讓 user systemd 在開機後、尚未登入時也能啟動並維持此 service。
+若不需要開機前登入即可執行，必須保留 linger 啟用。可用以下指令驗證：
+
+```bash
+loginctl show-user "$USER" -p Linger
+systemctl --user is-enabled codex-supervisor-watch.service
+systemctl --user is-active codex-supervisor-watch.service
 ```
 
 此 service 每 5 秒掃描所有仍有 active writer 的互動 Codex sessions。查看 log：
@@ -140,7 +151,7 @@ codex-supervisor resume <job-id>
 
 ## 限制
 
-- 原 Codex 必須保持開啟並持有 writer。user service 只在登入的 user systemd 工作階段執行；登出後不會繼續，除非另外設定 user linger。
+- 原 Codex 必須保持開啟並持有 writer。未啟用 user linger 時，user service 依賴登入的 user systemd 工作階段；啟用 linger 後，可在未登入時由 user systemd 啟動並維持執行。
 - 本機 Linux 專用：唯讀使用 Codex 的 `state_5.sqlite`、rollout JSONL、`thread-writer-locks` 與 `/proc/locks`。
   這些內部格式可能改變；不修改 Codex database 或鎖檔。Remote／ephemeral sessions 不在此模式的支援範圍。
 - queue 已在真實 TUI 驗證；不保證跨版本相容。沒有 `queue` 指令時明確報錯，不偷偷切回 `exec resume`。
@@ -173,6 +184,12 @@ python3 -m pytest -q tests/test_systemd_integration.py
 systemctl --user disable --now codex-supervisor-watch.service
 rm ~/.config/systemd/user/codex-supervisor-watch.service
 systemctl --user daemon-reload
+```
+
+若也不再需要該 user 的 user services 在未登入時執行，可另外停用 linger：
+
+```bash
+loginctl disable-linger "$USER"
 ```
 
 若使用 pipx：`pipx uninstall codex-supervisor`。若使用 venv：`.venv/bin/pip uninstall codex-supervisor`。

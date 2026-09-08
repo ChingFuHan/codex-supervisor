@@ -14,7 +14,6 @@ from pathlib import Path
 from .codex_db import find_interactive_sessions, get_session_info, has_active_writer
 from .models import ExitClassification, Job, JobStatus, SupervisorConfig
 from .parser import detect_rate_limit, parse_event, parse_reset_time
-from .retry import decide_retry
 from .state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -22,6 +21,7 @@ UTC = dt.timezone.utc
 # An accepted queue command is not proof of execution. Never resend on timeout.
 QUEUE_ACK_SECONDS = 120
 PROGRESS_ITEM_TYPES = frozenset(("Reasoning", "CommandExecution", "Extension", "AgentMessage"))
+RATE_LIMIT_POLL_SECONDS = 5 * 60
 
 
 class RolloutTail:
@@ -255,7 +255,7 @@ class InteractiveSupervisor:
 
     def _refresh_rate_limit_deadline(self, job: Job, event: dict,
                                      limit, now: dt.datetime) -> bool:
-        """Re-evaluate clock-only reset messages on an unchanged terminal event."""
+        """Refresh the advisory reset hint without changing fixed polling."""
         if (job.status != JobStatus.RATE_LIMITED
                 or not limit
                 or event.get("payload", {}).get("type") != "task_complete"):
@@ -268,12 +268,25 @@ class InteractiveSupervisor:
         if limit.reset_at is None:
             return False
         refreshed = limit.reset_at.isoformat()
-        if refreshed == job.parsed_reset and refreshed == job.scheduled_resume:
+        if refreshed == job.parsed_reset:
             return False
         job.parsed_reset = refreshed
-        job.scheduled_resume = refreshed
         self._record(job, "RATE_LIMIT_DEADLINE_REFRESHED", now,
-                     reset_at=refreshed)
+                     reset_at=refreshed, retry_at=job.scheduled_resume)
+        return True
+
+    def _migrate_retry_policy(self, job: Job, now: dt.datetime) -> bool:
+        """Move old interactive jobs from server deadlines to fixed polling."""
+        if job.mode != "interactive" or job.retry_policy == "fixed_poll_v1":
+            return False
+        job.retry_policy = "fixed_poll_v1"
+        if job.status == JobStatus.RATE_LIMITED:
+            job.scheduled_resume = (
+                now + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)
+            ).isoformat()
+            self._record(job, "RETRY_POLICY_MIGRATED", now,
+                         retry_at=job.scheduled_resume,
+                         poll_seconds=RATE_LIMIT_POLL_SECONDS)
         return True
 
     def tick(self, info: dict, prompt: str = "continue", *, adopt: bool = False,
@@ -314,6 +327,7 @@ class InteractiveSupervisor:
             if job.status == JobStatus.CANCELLED:
                 return job
 
+            policy_migrated = self._migrate_retry_policy(job, now)
             deadline_refreshed = self._refresh_rate_limit_deadline(
                 job, event, limit, now,
             ) if event else False
@@ -321,7 +335,7 @@ class InteractiveSupervisor:
                 job, event, tail, progress, key, now,
             ) if event else False
             progress_changed = self._observe_progress(job, progress, now)
-            if deadline_refreshed or progress_changed or legacy_restored:
+            if policy_migrated or deadline_refreshed or progress_changed or legacy_restored:
                 self.store.save_job(job)
 
             if continue_now:
@@ -350,7 +364,25 @@ class InteractiveSupervisor:
                 else:
                     return job
             else:
-                continuation_pending = job.continuation_outcome == "queued"
+                continuation_pending = (
+                    job.continuation_outcome == "queued"
+                    or (job.continuation_outcome in ("started", "working")
+                        and job.continuation_turn_id == payload.get("turn_id"))
+                )
+
+            # Repair persisted outcomes left active by older watchers after
+            # they had already consumed the terminal lifecycle event.
+            if (continuation_pending and key == job.observed_event
+                    and kind in ("task_complete", "turn_aborted")):
+                if kind == "turn_aborted":
+                    outcome = "aborted"
+                elif limit:
+                    outcome = ("rate_limited_after_progress" if job.progress_item_count
+                               else "rate_limited_before_progress")
+                else:
+                    outcome = "failed" if payload.get("error") else "completed"
+                self._mark_continuation_terminal(job, outcome, now)
+                self.store.save_job(job)
 
             if key != job.observed_event:
                 job.observed_event = key
@@ -390,15 +422,17 @@ class InteractiveSupervisor:
                         except (KeyError, ValueError, TypeError):
                             reference = now
                         limit.reset_at = parse_reset_time(limit.raw_message, reference)
-                        decision = decide_retry(job, ExitClassification.RATE_LIMIT, limit, self.config)
-                        wake = limit.reset_at or now + dt.timedelta(seconds=decision.delay_seconds)
+                        wake = now + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)
                         job.status = JobStatus.RATE_LIMITED
+                        job.retry_policy = "fixed_poll_v1"
                         job.exit_classification = ExitClassification.RATE_LIMIT.value
                         job.rate_limit_detected = now.isoformat()
                         job.parsed_reset = limit.reset_at.isoformat() if limit.reset_at else None
                         job.scheduled_resume = wake.isoformat()
                         self._record(job, "RATE_LIMIT", now, reset_at=job.parsed_reset,
-                                     wake_at=job.scheduled_resume, retry=job.rate_limit_retries)
+                                     wake_at=job.scheduled_resume,
+                                     poll_seconds=RATE_LIMIT_POLL_SECONDS,
+                                     retry=job.rate_limit_retries)
                         if continuation_pending:
                             self._mark_continuation_terminal(
                                 job,

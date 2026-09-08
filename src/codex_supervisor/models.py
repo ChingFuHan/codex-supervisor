@@ -66,6 +66,7 @@ class Job:
     progress_item_count: int = 0
     progress_summary: list[str] = dataclasses.field(default_factory=list)
     continuation_outcome: str | None = None
+    retry_policy: str = "fixed_poll_v1"
 
     def to_dict(self) -> dict:
         d = dataclasses.asdict(self)
@@ -76,6 +77,8 @@ class Job:
     def from_dict(cls, d: dict) -> "Job":
         d = dict(d)
         d["status"] = JobStatus(d["status"])
+        # Jobs written before fixed polling used the Codex-provided deadline.
+        d.setdefault("retry_policy", "legacy_reset_time")
         return cls(**d)
 
 

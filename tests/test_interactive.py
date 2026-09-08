@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import pytest
 
-from codex_supervisor.interactive import InteractiveSupervisor, RolloutTail
+from codex_supervisor.interactive import InteractiveSupervisor, RolloutTail, RATE_LIMIT_POLL_SECONDS
 from codex_supervisor.models import JobStatus, SupervisorConfig
 from codex_supervisor.state import StateStore
 from codex_supervisor.state import WatchAlreadyRunning
@@ -73,9 +73,9 @@ def test_wait_queue_complete_then_another_limit(monitor):
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         job = sup.tick(info, now=NOW)
         assert job.status == JobStatus.RATE_LIMITED
-        sup.tick(info, now=NOW + dt.timedelta(seconds=59))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS - 1))
         queue.assert_not_called()
-        job = sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         assert job.status == JobStatus.SCHEDULED
         assert queue.call_args.args[0] == ["codex", "queue", "--thread", SID, "--message", "continue"]
         append(path, "task_started", "t2")
@@ -83,7 +83,8 @@ def test_wait_queue_complete_then_another_limit(monitor):
         append(path, "task_complete", "t2")
         assert sup.tick(info, now=NOW).status == JobStatus.COMPLETED
         limited(path, "t3", "2026-09-07T11:00:00Z")
-        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS * 2))
         assert queue.call_count == 2
 
 
@@ -92,7 +93,7 @@ def test_continuation_rate_limit_before_progress_is_explicit(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
         progress(path, "t2", "UserMessage")
         limited(path, "t2", "2026-09-07T13:00:00Z")
@@ -109,10 +110,10 @@ def test_continuation_progress_is_recorded_before_completion(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
-        progress(path, "t2", "CommandExecution", NOW + dt.timedelta(seconds=61))
-        job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
+        progress(path, "t2", "CommandExecution", NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS + 1))
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS + 1))
     assert queue.call_count == 1
     assert job.status == JobStatus.RUNNING
     assert job.continuation_outcome == "working"
@@ -125,7 +126,7 @@ def test_continuation_rate_limit_after_progress_is_distinguished(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
         progress(path, "t2", "Reasoning")
         limited(path, "t2", "2026-09-07T13:00:00Z")
@@ -142,7 +143,7 @@ def test_progress_after_terminal_event_is_not_counted(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
         limited(path, "t2", "2026-09-07T13:00:00Z")
         progress(path, "t2", "CommandExecution")
@@ -157,7 +158,7 @@ def test_legacy_queued_terminal_is_backfilled(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success):
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
         progress(path, "t2", "UserMessage")
         limited(path, "t2", "2026-09-07T13:00:00Z")
@@ -181,7 +182,7 @@ def test_continuation_progress_survives_watcher_restart(monitor):
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         append(path, "task_started", "t2")
         progress(path, "t2", "Extension")
         job = sup.tick(info, now=NOW + dt.timedelta(seconds=61))
@@ -195,13 +196,39 @@ def test_continuation_progress_survives_watcher_restart(monitor):
     assert recovered.progress_summary == ["Extension"]
 
 
+@pytest.mark.parametrize("terminal", ["completed", "rate_limited_after_progress", "failed", "aborted"])
+def test_working_turn_reaches_terminal_across_polls(monitor, terminal):
+    sup, info, path = monitor
+    limited(path)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        sup.tick(info, now=NOW)
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
+        append(path, "task_started", "t2")
+        sup.tick(info, now=NOW)
+        progress(path, "t2", "CommandExecution")
+        assert sup.tick(info, now=NOW).continuation_outcome == "working"
+        if terminal == "rate_limited_after_progress":
+            limited(path, "t2", "2099-01-01T00:00:00Z")
+        else:
+            append(path, "turn_aborted" if terminal == "aborted" else "task_complete", "t2",
+                   {"message": "failure"} if terminal == "failed" else None)
+        job = sup.tick(info, now=NOW)
+        assert job.continuation_outcome == terminal
+        assert queue.call_count == 1
+        if terminal != "aborted":
+            job.continuation_outcome = "working"
+            sup.store.save_job(job)
+            restarted = InteractiveSupervisor(sup.config, sup.store, "codex")
+            assert restarted.tick(info, now=NOW).continuation_outcome == terminal
+
+
 def test_queue_without_new_turn_becomes_unconfirmed(monitor):
     sup, info, path = monitor
     limited(path)
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
         sup.tick(info, now=NOW)
-        sup.tick(info, now=NOW + dt.timedelta(seconds=60))
-        job = sup.tick(info, now=NOW + dt.timedelta(seconds=181))
+        sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
+        job = sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS + 121))
     assert queue.call_count == 1
     assert job.status == JobStatus.FAILED
     assert job.continuation_outcome == "unconfirmed"
@@ -211,9 +238,9 @@ def test_no_reset_backoff_does_not_move_on_every_poll(monitor):
     sup, info, path = monitor
     limited(path, reset=None)
     job = sup.tick(info, now=NOW)
-    assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(minutes=1)
+    assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)
     job = sup.tick(info, now=NOW + dt.timedelta(seconds=5))
-    assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(minutes=1)
+    assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)
 
 
 def test_stale_clock_deadline_is_refreshed_and_queued(monitor, monkeypatch):
@@ -225,8 +252,11 @@ def test_stale_clock_deadline_is_refreshed_and_queued(monitor, monkeypatch):
         job = sup.tick(info, now=dt.datetime(2026, 9, 7, 22, 0, tzinfo=dt.timezone.utc))
         assert job.status == JobStatus.RATE_LIMITED
         job.scheduled_resume = "2026-09-09T06:28:00+08:00"
+        job.retry_policy = "legacy_reset_time"
         sup.store.save_job(job)
         job = sup.tick(info, now=dt.datetime(2026, 9, 7, 22, 30, tzinfo=dt.timezone.utc))
+        assert queue.call_count == 0
+        job = sup.tick(info, now=dt.datetime(2026, 9, 7, 22, 35, tzinfo=dt.timezone.utc))
     assert queue.call_count == 1
     assert job.status == JobStatus.SCHEDULED
     assert job.continuation_outcome == "queued"
@@ -239,7 +269,8 @@ def test_restart_and_other_watcher_do_not_duplicate(monitor):
         sup.tick(info, now=NOW)
         other = InteractiveSupervisor(sup.config, sup.store, "codex")
         other.tick(info, now=NOW)
-        job = other.tick(info, now=NOW + dt.timedelta(minutes=3))
+        other.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
+        job = other.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS + 121))
         assert queue.call_count == 1
         assert job.status == JobStatus.FAILED
         assert "not resending" in job.last_error
@@ -297,7 +328,8 @@ def test_uncertain_queue_outcome_is_never_retried(monitor, error):
     sup, info, path = monitor
     limited(path, reset="2026-09-07T11:00:00Z")
     with patch("codex_supervisor.interactive.subprocess.run", side_effect=error) as queue:
-        assert sup.tick(info, now=NOW).status == JobStatus.FAILED
+        sup.tick(info, now=NOW)
+        assert sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)).status == JobStatus.FAILED
         sup.tick(info, now=NOW + dt.timedelta(hours=2))
         assert queue.call_count == 1
 
@@ -339,8 +371,9 @@ def test_fake_queue_process_drives_real_rollout_observation(monitor, tmp_path):
     fake.chmod(0o700)
     sup.codex = str(fake)
     limited(path, reset="2026-09-07T11:00:00Z")
-    assert sup.tick(info, now=NOW).status == JobStatus.SCHEDULED
-    assert sup.tick(info, now=NOW).status == JobStatus.COMPLETED
+    assert sup.tick(info, now=NOW).status == JobStatus.RATE_LIMITED
+    assert sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS)).status == JobStatus.SCHEDULED
+    assert sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS + 1)).status == JobStatus.COMPLETED
 
 
 def test_sigint_only_stops_monitor(tmp_path):
@@ -390,8 +423,9 @@ def test_no_writer_means_no_queue(monitor, monkeypatch):
     monkeypatch.setattr("codex_supervisor.interactive.has_active_writer", lambda sid: False)
     limited(path, reset="2026-09-07T11:00:00Z")
     with patch("codex_supervisor.interactive.subprocess.run") as queue:
+        sup.tick(info, now=NOW)
         with pytest.raises(ValueError, match="no live Codex writer"):
-            sup.tick(info, now=NOW)
+            sup.tick(info, now=NOW + dt.timedelta(seconds=RATE_LIMIT_POLL_SECONDS))
         queue.assert_not_called()
         assert sup.store.load_all_jobs()[0].submitted_event is None
 
@@ -460,6 +494,7 @@ def test_concurrent_watchers_submit_only_once(monitor, tmp_path):
                    "time.sleep(.1)\n")
     fake.chmod(0o700)
     limited(path, reset="2026-09-07T11:00:00Z")
+    sup.tick(info, now=NOW)
     code = (
         "import json,sys; from pathlib import Path; "
         "from codex_supervisor.interactive import InteractiveSupervisor; "

@@ -104,6 +104,7 @@ def cmd_status(args, config, store) -> int:
     print(f"last_error:        {job.last_error or '(none)'}")
     print(f"scheduled_resume:  {job.scheduled_resume or '(none)'}")
     print(f"parsed_reset:      {job.parsed_reset or '(none)'}")
+    print(f"retry_policy:      {job.retry_policy}")
     print(f"queue_id:          {job.queue_id or '(none)'}")
     print(f"queued_at:         {job.queued_at or '(none)'}")
     print(f"continuation:      {job.continuation_outcome or '(none)'}")

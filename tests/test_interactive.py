@@ -46,6 +46,13 @@ def limited(path, turn="t1", reset="2026-09-07T12:01:00Z"):
                        message=f"Usage limit. Resets at {reset}" if reset else "Usage limit."))
 
 
+def clock_limited(path, turn="t1", timestamp=None):
+    return append(path, "task_complete", turn,
+                  dict(codex_error_info="usage_limit_exceeded",
+                       message="You've hit your usage limit. Try again at 06:28 AM."),
+                  timestamp=timestamp)
+
+
 def progress(path, turn="t1", item_type="CommandExecution", timestamp=None):
     event = dict(timestamp=(timestamp or NOW).isoformat(), type="event_msg",
                  payload=dict(type="item_completed", turn_id=turn,
@@ -207,6 +214,22 @@ def test_no_reset_backoff_does_not_move_on_every_poll(monitor):
     assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(minutes=1)
     job = sup.tick(info, now=NOW + dt.timedelta(seconds=5))
     assert dt.datetime.fromisoformat(job.scheduled_resume) == NOW + dt.timedelta(minutes=1)
+
+
+def test_stale_clock_deadline_is_refreshed_and_queued(monitor, monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Taipei")
+    sup, info, path = monitor
+    event_time = dt.datetime(2026, 9, 7, 22, 28, 5, tzinfo=dt.timezone.utc)
+    clock_limited(path, timestamp=event_time)
+    with patch("codex_supervisor.interactive.subprocess.run", side_effect=success) as queue:
+        job = sup.tick(info, now=dt.datetime(2026, 9, 7, 22, 0, tzinfo=dt.timezone.utc))
+        assert job.status == JobStatus.RATE_LIMITED
+        job.scheduled_resume = "2026-09-09T06:28:00+08:00"
+        sup.store.save_job(job)
+        job = sup.tick(info, now=dt.datetime(2026, 9, 7, 22, 30, tzinfo=dt.timezone.utc))
+    assert queue.call_count == 1
+    assert job.status == JobStatus.SCHEDULED
+    assert job.continuation_outcome == "queued"
 
 
 def test_restart_and_other_watcher_do_not_duplicate(monitor):

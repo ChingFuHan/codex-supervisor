@@ -227,6 +227,13 @@ def test_reset_local_clock_relative_to_original_error(monkeypatch):
     assert result == datetime.datetime(2026, 9, 6, 22, 30, tzinfo=datetime.timezone.utc)
 
 
+def test_reset_local_clock_at_reference_stays_same_day(monkeypatch):
+    monkeypatch.setenv("TZ", "Asia/Taipei")
+    reference = datetime.datetime(2026, 9, 7, 22, 28, 5, tzinfo=datetime.timezone.utc)
+    result = parse_reset_time("Try again at 06:28 AM.", reference)
+    assert result == datetime.datetime(2026, 9, 7, 22, 28, tzinfo=datetime.timezone.utc)
+
+
 def test_reset_actual_codex_full_date(monkeypatch):
     monkeypatch.setenv("TZ", "Asia/Taipei")
     result = parse_reset_time("try again at Sep 7th, 2026 2:04 AM.")

@@ -253,6 +253,29 @@ class InteractiveSupervisor:
         )
         return True
 
+    def _refresh_rate_limit_deadline(self, job: Job, event: dict,
+                                     limit, now: dt.datetime) -> bool:
+        """Re-evaluate clock-only reset messages on an unchanged terminal event."""
+        if (job.status != JobStatus.RATE_LIMITED
+                or not limit
+                or event.get("payload", {}).get("type") != "task_complete"):
+            return False
+        try:
+            reference = dt.datetime.fromisoformat(event["timestamp"])
+        except (KeyError, ValueError, TypeError):
+            reference = now
+        limit.reset_at = parse_reset_time(limit.raw_message, reference)
+        if limit.reset_at is None:
+            return False
+        refreshed = limit.reset_at.isoformat()
+        if refreshed == job.parsed_reset and refreshed == job.scheduled_resume:
+            return False
+        job.parsed_reset = refreshed
+        job.scheduled_resume = refreshed
+        self._record(job, "RATE_LIMIT_DEADLINE_REFRESHED", now,
+                     reset_at=refreshed)
+        return True
+
     def tick(self, info: dict, prompt: str = "continue", *, adopt: bool = False,
              continue_now: bool = False, now: dt.datetime | None = None) -> Job | None:
         """One non-sleeping session step; the file lock also protects other watchers."""
@@ -291,11 +314,14 @@ class InteractiveSupervisor:
             if job.status == JobStatus.CANCELLED:
                 return job
 
+            deadline_refreshed = self._refresh_rate_limit_deadline(
+                job, event, limit, now,
+            ) if event else False
             legacy_restored = self._restore_legacy_terminal(
                 job, event, tail, progress, key, now,
             ) if event else False
             progress_changed = self._observe_progress(job, progress, now)
-            if progress_changed or legacy_restored:
+            if deadline_refreshed or progress_changed or legacy_restored:
                 self.store.save_job(job)
 
             if continue_now:

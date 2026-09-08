@@ -110,7 +110,11 @@ def parse_reset_time(
         try:
             parsed = datetime.datetime.strptime(clock, "%I:%M %p" if match[2] else "%H:%M")
             result = now.replace(hour=parsed.hour, minute=parsed.minute, second=0, microsecond=0)
-            if result <= now:
+            # Rollout errors are timestamped at the reset minute. With an
+            # event reference, a few seconds past that minute means the
+            # reset just happened, not that it is tomorrow. Standalone
+            # parsing still selects the next occurrence for past clock times.
+            if result <= now and reference_time is None:
                 result += datetime.timedelta(days=1)
             return result
         except ValueError:
